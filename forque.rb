@@ -3,18 +3,11 @@ require 'ohai'
 require 'base64'
 
 class Forque
-  include Enumerable
-
-  # detect system
-  ohai = Ohai::System.new
-  ohai.all_plugins
-  THREADS = ohai['cpu']['total']
-
   def initialize(*items)
     @items = Array(items)
   end
 
-  def each
+  def collect(&blk)
     children_pids = []
     children_pipes = []
     [THREADS, @items.size].min.times do
@@ -26,10 +19,17 @@ class Forque
         begin
           while input = child_read.gets and input != "\n"
             input = decode(input.chomp)
-            child_write.write(encode(input)+"\n")
+            begin
+              result = blk.call(input)
+            rescue Exception => ex
+              result = ForqueExceptionWrapper.new(ex) 
+            end
+            child_write.write(encode(result)+"\n")
           end
         rescue Interrupt
-          STDERR.write "Forque Aborted\n"
+          # init forque aborted
+          child_read.close
+          child_write.close
         end
       end
       child_write.close
@@ -45,12 +45,17 @@ class Forque
 
     listener_threads = []
 
+    result = []
+
     children_pipes.each do |p|
       listener_threads << Thread.new do
         begin
           while input = p[:read].gets
             input = decode(input.chomp)
-            yield(input)
+            if ForqueExceptionWrapper === input
+              raise input.exception
+            end
+            result << input
             if items_to_send.empty?
               p[:read].close
               p[:write].close
@@ -60,7 +65,10 @@ class Forque
             end
           end
         rescue Interrupt
-          STDERR.write "Forque Aborted\n"
+          # listener forque aborted
+          p[:read].close
+          p[:write].close
+          raise "Forque Aborted"
         end
       end
     end
@@ -69,7 +77,7 @@ class Forque
       begin
         t.join
       rescue Interrupt
-        STDERR.write "Forque Aborted\n"
+        # listener died
       end
     end
 
@@ -77,15 +85,29 @@ class Forque
       begin
         Process.wait(p)
       rescue Interrupt
-        STDERR.write "Forque Aborted\n"
+        # child died
       end
+    end
+
+    return result
+  end
+
+  class ForqueExceptionWrapper
+    attr_reader :exception
+    def initialize(exception)
+      @exception = exception
     end
   end
 
   private
 
+  # detect system
+  ohai = Ohai::System.new
+  ohai.all_plugins
+  THREADS = ohai['cpu']['total']
+
   def encode(obj)
-    Base64.encode64(Marshal.dump(obj))
+    Base64.encode64(Marshal.dump(obj)).split("\n").join
   end
 
   def decode(str)
